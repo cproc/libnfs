@@ -24,14 +24,17 @@
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
+#include <dirent.h>
 #include <asm/fcntl.h>
 
 #include <nfsc/libnfs.h>
+#include <nfsc/libnfs-raw.h>
 
 #include <sys/syscall.h>
 #include <dlfcn.h>
 
 #define NFS_MAX_FD  255
+#define NFS_MAX_DIR 255
 
 static int debug = 0;
 static int nfsuid = -1;
@@ -63,61 +66,123 @@ struct nfs_fd_list {
 
 static struct nfs_fd_list nfs_fd_list[NFS_MAX_FD];
 
+struct nfs_dir_list {
+	int is_allocated;
+	struct nfs_context *nfs;
+	struct nfsdir *dir;
+};
+
+static struct nfs_dir_list nfs_dir_list[NFS_MAX_DIR];
+
+static void *alloc_dir(struct nfs_context *nfs,
+                      struct nfsdir *dir)
+{
+	int i;
+	for (i = 0; i < NFS_MAX_DIR; i++) {
+		if (!nfs_dir_list[i].is_allocated) {
+			nfs_dir_list[i].is_allocated = 1;
+			nfs_dir_list[i].nfs = nfs;
+			nfs_dir_list[i].dir = dir;
+			return &nfs_dir_list[i];
+		}
+	}
+
+	return NULL;
+}
+
+static int lookup_dir(void *dirp, struct nfs_context **nfs_out,
+                      struct nfsdir **dir_out)
+{
+	int i;
+	for (i = 0; i < NFS_MAX_DIR; i++) {
+		if (dirp == &nfs_dir_list[i]) {
+			*nfs_out = nfs_dir_list[i].nfs;
+			*dir_out = nfs_dir_list[i].dir;
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+static void free_dir(void *dirp)
+{
+	((struct nfs_dir_list*)dirp)->is_allocated = 0;
+}
+
+/* statically allocated dirent to be returned by 'readdir()' */
+static struct dirent dirent;
+
+static struct nfs_context *mount_path(const char *path)
+{
+	struct nfs_context *nfs;
+	struct nfs_url *url;
+	int ret;
+
+	nfs = nfs_init_context();
+	if (nfs == NULL) {
+		LD_NFS_DPRINTF(1, "Failed to create context");
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	if (nfsuid >= 0)
+		nfs_set_uid(nfs, nfsuid);
+	if (nfsgid >= 0)
+		nfs_set_gid(nfs, nfsgid);
+
+	url = nfs_parse_url_dir(nfs, path);
+
+	if ((url == NULL) || (url->server == NULL) || (url->path == NULL)) {
+		LD_NFS_DPRINTF(1, "Failed to parse URL: %s\n",
+			nfs_get_error(nfs));
+		if (url != NULL)
+			nfs_destroy_url(url);
+		nfs_destroy_context(nfs);
+		errno = EINVAL;
+		return NULL;
+	}
+
+	if ((ret = nfs_mount(nfs, url->server, url->path)) != 0) {
+		LD_NFS_DPRINTF(1, "Failed to mount nfs share : %s\n",
+		       nfs_get_error(nfs));
+		nfs_destroy_url(url);
+		nfs_destroy_context(nfs);
+		errno = -ret;
+		return NULL;
+	}
+
+	nfs_destroy_url(url);
+
+	return nfs;
+}
+
 int (*real_open)(__const char *path, int flags, mode_t mode);
 
 int open(const char *path, int flags, mode_t mode)
 {
 	if (!strncmp(path, "nfs:", 4)) {
 		struct nfs_context *nfs;
-		struct nfs_url *url;
 		struct nfsfh *fh = NULL;
 		int ret, fd;
 
 		LD_NFS_DPRINTF(9, "open(%s, %x, %o)", path, flags, mode);
-		nfs = nfs_init_context();
-		if (nfs == NULL) {
-			LD_NFS_DPRINTF(1, "Failed to create context");
-			errno = ENOMEM;
-			return -1;
-		}
 
-		if (nfsuid >= 0)
-			nfs_set_uid(nfs, nfsuid);
-		if (nfsgid >= 0)
-			nfs_set_gid(nfs, nfsgid);
-
-		url = nfs_parse_url_full(nfs, path);
-		if (url == NULL) {
-			LD_NFS_DPRINTF(1, "Failed to parse URL: %s\n",
-				nfs_get_error(nfs));
-			nfs_destroy_context(nfs);
-			errno = EINVAL;
+		if ((nfs = mount_path(path)) == NULL)
 			return -1;
-		}
-
-		if (nfs_mount(nfs, url->server, url->path) != 0) {
-			LD_NFS_DPRINTF(1, "Failed to mount nfs share : %s\n",
-			       nfs_get_error(nfs));
-			nfs_destroy_url(url);
-			nfs_destroy_context(nfs);
-			errno = EINVAL;
-			return -1;
-		}
 
 		if (flags & O_CREAT) {
-			if ((ret = nfs_creat(nfs, url->file, mode, &fh)) != 0) {
+			if ((ret = nfs_creat(nfs, "", mode, &fh)) != 0) {
 				LD_NFS_DPRINTF(1, "Failed to creat nfs file : "
 					"%s\n", nfs_get_error(nfs));
-				nfs_destroy_url(url);
 				nfs_destroy_context(nfs);
 				errno = -ret;
 				return -1;
 			}
 		} else {
-			if ((ret = nfs_open(nfs, url->file, flags, &fh)) != 0) {
+			if ((ret = nfs_open(nfs, "", flags, &fh)) != 0) {
 				LD_NFS_DPRINTF(1, "Failed to open nfs file : "
 					"%s\n", nfs_get_error(nfs));
-				nfs_destroy_url(url);
 				nfs_destroy_context(nfs);
 				errno = -ret;
 				return -1;
@@ -127,7 +192,6 @@ int open(const char *path, int flags, mode_t mode)
 		fd = nfs_get_fd(nfs);
 		if (fd >= NFS_MAX_FD) {
 			LD_NFS_DPRINTF(1, "Too many files open");
-			nfs_destroy_url(url);
 			nfs_destroy_context(nfs);
 			errno = ENFILE;
 			return -1;
@@ -139,8 +203,6 @@ int open(const char *path, int flags, mode_t mode)
 		nfs_fd_list[fd].path       = strdup(path);
 		nfs_fd_list[fd].flags      = flags;
 		nfs_fd_list[fd].mode       = mode;
-
-		nfs_destroy_url(url);
 
 		LD_NFS_DPRINTF(9, "open(%s) == %d", path, fd);
 		return fd;
@@ -339,91 +401,186 @@ int dup2(int oldfd, int newfd)
 	return real_dup2(oldfd, newfd);
 }
 
-int (*real_xstat)(int ver, __const char *path, struct stat *buf);
+int (*real___xstat)(int ver, __const char *path, struct stat *buf);
 
 int __xstat(int ver, const char *path, struct stat *buf)
 {
 	if (!strncmp(path, "nfs:", 4)) {
-		int fd, ret;
+		struct nfs_context *nfs;
+		struct nfs_stat_64 st64;
+		int ret;
 
 		LD_NFS_DPRINTF(9, "__xstat(%s)", path);
-		fd = open(path, 0, 0);
-		if (fd == -1) {
-			return fd;
+
+		if ((nfs = mount_path(path)) == NULL)
+			return -1;
+
+		ret = nfs_stat64(nfs, "", (void *)&st64);
+
+		nfs_destroy_context(nfs);
+	
+		if (ret < 0) {
+			errno = -ret;
+			return -1;
 		}
 
-		ret = __fxstat(ver, fd, buf);
-		close(fd);
+		buf->st_dev     = st64.nfs_dev;
+		buf->st_ino     = st64.nfs_ino;
+		buf->st_mode    = st64.nfs_mode;
+		buf->st_nlink   = st64.nfs_nlink;
+		buf->st_uid     = st64.nfs_uid;
+		buf->st_gid     = st64.nfs_gid;
+		buf->st_rdev    = st64.nfs_rdev;
+		buf->st_size    = st64.nfs_size;
+		buf->st_blksize = st64.nfs_blksize;
+		buf->st_blocks  = st64.nfs_blocks;
+		buf->st_atim.tv_sec   = st64.nfs_atime;
+		buf->st_mtim.tv_sec   = st64.nfs_mtime;
+		buf->st_ctim.tv_sec   = st64.nfs_ctime;
+
+		LD_NFS_DPRINTF(9, "__xstat(%s) success", path);
 		return ret;
 	}
 
-	return real_xstat(ver, path, buf);
+	return real___xstat(ver, path, buf);
 }
 
-int (*real_xstat64)(int ver, __const char *path, struct stat64 *buf);
+int (*real___xstat64)(int ver, __const char *path, struct stat64 *buf);
 
 int __xstat64(int ver, const char *path, struct stat64 *buf)
 {
 	if (!strncmp(path, "nfs:", 4)) {
-		int fd, ret;
+		struct nfs_context *nfs;
+		struct nfs_stat_64 st64;
+		int ret;
 
 		LD_NFS_DPRINTF(9, "__xstat64(%s)", path);
-		fd = open(path, 0, 0);
-		if (fd == -1) {
-			return fd;
+
+		if ((nfs = mount_path(path)) == NULL)
+			return -1;
+
+		ret = nfs_stat64(nfs, "", (void *)&st64);
+
+		nfs_destroy_context(nfs);
+	
+		if (ret < 0) {
+			errno = -ret;
+			return -1;
 		}
 
-		ret = __fxstat64(ver, fd, buf);
-		close(fd);
+		buf->st_dev     = st64.nfs_dev;
+		buf->st_ino     = st64.nfs_ino;
+		buf->st_mode    = st64.nfs_mode;
+		buf->st_nlink   = st64.nfs_nlink;
+		buf->st_uid     = st64.nfs_uid;
+		buf->st_gid     = st64.nfs_gid;
+		buf->st_rdev    = st64.nfs_rdev;
+		buf->st_size    = st64.nfs_size;
+		buf->st_blksize = st64.nfs_blksize;
+		buf->st_blocks  = st64.nfs_blocks;
+		buf->st_atim.tv_sec   = st64.nfs_atime;
+		buf->st_mtim.tv_sec   = st64.nfs_mtime;
+		buf->st_ctim.tv_sec   = st64.nfs_ctime;
+
+		LD_NFS_DPRINTF(9, "__xstat64(%s) success", path);
 		return ret;
 	}
 
-	return real_xstat64(ver, path, buf);
+	return real___xstat64(ver, path, buf);
+
 }
 
-int (*real_lxstat)(int ver, __const char *path, struct stat *buf);
+int (*real___lxstat)(int ver, __const char *path, struct stat *buf);
 
 int __lxstat(int ver, const char *path, struct stat *buf)
 {
 	if (!strncmp(path, "nfs:", 4)) {
-		int fd, ret;
+		struct nfs_context *nfs;
+		struct nfs_stat_64 st64;
+		int ret;
 
 		LD_NFS_DPRINTF(9, "__lxstat(%s)", path);
-		fd = open(path, 0, 0);
-		if (fd == -1) {
-			return fd;
+
+		if ((nfs = mount_path(path)) == NULL)
+			return -1;
+
+		ret = nfs_lstat64(nfs, "", (void *)&st64);
+
+		nfs_destroy_context(nfs);
+	
+		if (ret < 0) {
+			LD_NFS_DPRINTF(9, "__lxstat(%s): nfs_lstat64() failed", path);
+			errno = -ret;
+			return -1;
 		}
 
-		ret = __fxstat(ver, fd, buf);
-		close(fd);
+		buf->st_dev     = st64.nfs_dev;
+		buf->st_ino     = st64.nfs_ino;
+		buf->st_mode    = st64.nfs_mode;
+		buf->st_nlink   = st64.nfs_nlink;
+		buf->st_uid     = st64.nfs_uid;
+		buf->st_gid     = st64.nfs_gid;
+		buf->st_rdev    = st64.nfs_rdev;
+		buf->st_size    = st64.nfs_size;
+		buf->st_blksize = st64.nfs_blksize;
+		buf->st_blocks  = st64.nfs_blocks;
+		buf->st_atim.tv_sec   = st64.nfs_atime;
+		buf->st_mtim.tv_sec   = st64.nfs_mtime;
+		buf->st_ctim.tv_sec   = st64.nfs_ctime;
+
+		LD_NFS_DPRINTF(9, "__lxstat(%s) success", path);
 		return ret;
 	}
 
-	return real_lxstat(ver, path, buf);
+	return real___lxstat(ver, path, buf);
 }
 
-int (*real_lxstat64)(int ver, __const char *path, struct stat64 *buf);
+int (*real___lxstat64)(int ver, __const char *path, struct stat64 *buf);
 
 int __lxstat64(int ver, const char *path, struct stat64 *buf)
 {
 	if (!strncmp(path, "nfs:", 4)) {
-		int fd, ret;
+		struct nfs_context *nfs;
+		struct nfs_stat_64 st64;
+		int ret;
 
 		LD_NFS_DPRINTF(9, "__lxstat64(%s)", path);
-		fd = open(path, 0, 0);
-		if (fd == -1) {
-			return fd;
+
+		if ((nfs = mount_path(path)) == NULL)
+			return -1;
+
+		ret = nfs_lstat64(nfs, "", (void *)&st64);
+
+		nfs_destroy_context(nfs);
+	
+		if (ret < 0) {
+			LD_NFS_DPRINTF(9, "__lxstat64(%s): lstat failed", path);
+			errno = -ret;
+			return -1;
 		}
 
-		ret = __fxstat64(ver, fd, buf);
-		close(fd);
+		buf->st_dev     = st64.nfs_dev;
+		buf->st_ino     = st64.nfs_ino;
+		buf->st_mode    = st64.nfs_mode;
+		buf->st_nlink   = st64.nfs_nlink;
+		buf->st_uid     = st64.nfs_uid;
+		buf->st_gid     = st64.nfs_gid;
+		buf->st_rdev    = st64.nfs_rdev;
+		buf->st_size    = st64.nfs_size;
+		buf->st_blksize = st64.nfs_blksize;
+		buf->st_blocks  = st64.nfs_blocks;
+		buf->st_atim.tv_sec   = st64.nfs_atime;
+		buf->st_mtim.tv_sec   = st64.nfs_mtime;
+		buf->st_ctim.tv_sec   = st64.nfs_ctime;
+
+		LD_NFS_DPRINTF(9, "__lxstat64(%s) success", path);
 		return ret;
 	}
 
-	return real_lxstat64(ver, path, buf);
+	return real___lxstat64(ver, path, buf);
 }
 
-int (*real_fxstat)(int ver, int fd, struct stat *buf);
+int (*real___fxstat)(int ver, int fd, struct stat *buf);
 
 int __fxstat(int ver, int fd, struct stat *buf)
 {
@@ -456,10 +613,10 @@ int __fxstat(int ver, int fd, struct stat *buf)
 		return ret;
 	}
 
-	return real_fxstat(ver, fd, buf);
+	return real___fxstat(ver, fd, buf);
 }
 
-int (*real_fxstat64)(int ver, int fd, struct stat64 *buf);
+int (*real___fxstat64)(int ver, int fd, struct stat64 *buf);
 
 int __fxstat64(int ver, int fd, struct stat64 *buf)
 {
@@ -492,10 +649,10 @@ int __fxstat64(int ver, int fd, struct stat64 *buf)
 		return ret;
 	}
 
-	return real_fxstat64(ver, fd, buf);
+	return real___fxstat64(ver, fd, buf);
 }
 
-int (*real_fxstatat)(int ver, int fd, const char *path, struct stat *buf, int flag);
+int (*real___fxstatat)(int ver, int fd, const char *path, struct stat *buf, int flag);
 
 int __fxstatat(int ver, int fd, const char *path, struct stat *buf, int flag)
 {
@@ -503,17 +660,17 @@ int __fxstatat(int ver, int fd, const char *path, struct stat *buf, int flag)
 		return __xstat(ver, path, buf);
 	}
 
-	return real_fxstatat(ver, fd, path, buf, flag);
+	return real___fxstatat(ver, fd, path, buf, flag);
 }
 
-int (*real_fxstatat64)(int ver, int fd, const char *path, struct stat64 *buf, int flag);
+int (*real___fxstatat64)(int ver, int fd, const char *path, struct stat64 *buf, int flag);
 
 int __fxstatat64(int ver, int fd, const char *path, struct stat64 *buf, int flag)
 {
 	if (!strncmp(path, "nfs:", 4)) {
 		return __xstat64(ver, path, buf);
 	}
-	return real_fxstatat64(ver, fd, path, buf, flag);
+	return real___fxstatat64(ver, fd, path, buf, flag);
 }
 
 int (*real_fallocate)(int fd, int mode, off_t offset, off_t len);
@@ -674,6 +831,162 @@ int fchownat(int fd, const char *path, uid_t uid, gid_t gid, int flags)
 	return real_fchownat(fd, path, uid, gid, flags);
 }
 
+DIR *(*real_opendir)(const char *name);
+
+DIR *opendir(const char *path)
+{
+	if (!strncmp(path, "nfs:", 4)) {
+		struct nfs_context *nfs;
+		struct nfsdir *nfsdir;
+		DIR *dir;
+		int ret;
+
+		LD_NFS_DPRINTF(9, "opendir(%s)", path);
+
+		if ((nfs = mount_path(path)) == NULL)
+			return NULL;
+
+		ret = nfs_opendir(nfs, "", &nfsdir);
+
+		if (ret != 0) {
+			nfs_destroy_context(nfs);
+			errno = -ret;
+			return NULL;
+		}
+
+		dir = alloc_dir(nfs, nfsdir);
+
+		if (dir == NULL) {
+			errno = ENFILE; 
+			return NULL;
+		}
+
+		LD_NFS_DPRINTF(9, "opendir(%s) success", path);
+
+		return (DIR*)dir;
+	}
+
+	return real_opendir(path);
+}
+
+struct dirent *(*real_readdir)(DIR *dirp);
+
+struct dirent *readdir(DIR *dirp)
+{
+	struct nfs_context *nfs;
+	struct nfsdir *nfsdir;
+
+	if (lookup_dir(dirp, &nfs, &nfsdir) == 0) {
+		struct nfsdirent *nfsdirent;
+		int ret;
+
+		LD_NFS_DPRINTF(9, "readdir()");
+
+		nfsdirent = nfs_readdir(nfs, nfsdir);
+
+		if (nfsdirent == NULL)
+			return NULL;
+
+		/* only 'd_ino' and 'd_name' are required by POSIX */
+		dirent.d_ino = nfsdirent->inode;
+		strncpy (dirent.d_name, nfsdirent->name, sizeof(dirent.d_name) - 1);
+
+		return &dirent;
+	}
+
+	return real_readdir(dirp);
+}
+
+int (*real_readdir_r)(DIR *dirp, struct dirent *entry, struct dirent **result);
+
+int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result)
+{
+	struct nfs_context *nfs;
+	struct nfsdir *nfsdir;
+
+	if (lookup_dir(dirp, &nfs, &nfsdir) == 0) {
+		LD_NFS_DPRINTF(9, "readdir_r(): not implemented");
+		*result = NULL;
+		return 0;
+	}
+
+	return real_readdir_r(dirp, entry, result);
+}
+
+void (*real_rewinddir)(DIR *dirp);
+
+void rewinddir(DIR *dirp)
+{
+	struct nfs_context *nfs;
+	struct nfsdir *nfsdir;
+
+	if (lookup_dir(dirp, &nfs, &nfsdir) == 0) {
+		LD_NFS_DPRINTF(9, "rewinddir()");
+		nfs_rewinddir(nfs, nfsdir);
+		return;
+	}
+
+	real_rewinddir(dirp);
+}
+
+void (*real_seekdir)(DIR *dirp, long loc);
+
+void seekdir(DIR *dirp, long loc)
+{
+	struct nfs_context *nfs;
+	struct nfsdir *nfsdir;
+
+	if (lookup_dir(dirp, &nfs, &nfsdir) == 0) {
+		LD_NFS_DPRINTF(9, "seekdir()");
+		nfs_seekdir(nfs, nfsdir, loc);
+		return;
+	}
+
+	real_seekdir(dirp, loc);
+}
+
+long (*real_telldir)(DIR *dirp);
+
+long telldir(DIR *dirp)
+{
+	struct nfs_context *nfs;
+	struct nfsdir *nfsdir;
+
+	if (lookup_dir(dirp, &nfs, &nfsdir) == 0) {
+		LD_NFS_DPRINTF(9, "telldir()");
+		return nfs_telldir(nfs, nfsdir);
+	}
+
+	return real_telldir(dirp);
+}
+
+int (*real_closedir)(DIR *dirp);
+
+int closedir(DIR *dirp)
+{
+	struct nfs_context *nfs;
+	struct nfsdir *nfsdir;
+
+	if (lookup_dir(dirp, &nfs, &nfsdir) == 0) {
+		LD_NFS_DPRINTF(9, "closedir()");
+		nfs_closedir(nfs, nfsdir);
+		nfs_destroy_context(nfs);
+		free_dir(dirp);
+		return 0;
+	}
+
+	return real_closedir(dirp);
+}
+
+#define DLSYM(func) \
+	do { \
+		real_##func = dlsym(RTLD_NEXT, #func); \
+		if (real_##func == NULL) { \
+			LD_NFS_DPRINTF(0, "Failed to dlsym("#func")"); \
+			exit(10); \
+		} \
+	} while(0);
+
 static void __attribute__((constructor)) _init(void)
 {
 	int i;
@@ -690,146 +1003,35 @@ static void __attribute__((constructor)) _init(void)
 		nfsgid = atoi(getenv("LD_NFS_GID"));
 	}
 
-	real_open = dlsym(RTLD_NEXT, "open");
-	if (real_open == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(open)");
-		exit(10);
-	}
-
-	real_close = dlsym(RTLD_NEXT, "close");
-	if (real_close == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(close)");
-		exit(10);
-	}
-
-	real_read = dlsym(RTLD_NEXT, "read");
-	if (real_read == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(read)");
-		exit(10);
-	}
-
-	real_pread = dlsym(RTLD_NEXT, "pread");
-	if (real_pread == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(pread)");
-		exit(10);
-	}
-
-	real_write = dlsym(RTLD_NEXT, "write");
-	if (real_write == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(write)");
-		exit(10);
-	}
-
-	real_pwrite = dlsym(RTLD_NEXT, "pwrite");
-	if (real_pwrite == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(pwrite)");
-		exit(10);
-	}
-
-	real_xstat = dlsym(RTLD_NEXT, "__xstat");
-	if (real_xstat == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(__xstat)");
-		exit(10);
-	}
-
-	real_xstat64 = dlsym(RTLD_NEXT, "__xstat64");
-	if (real_xstat64 == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(__xstat64)");
-	}
-
-	real_lxstat = dlsym(RTLD_NEXT, "__lxstat");
-	if (real_lxstat == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(__lxstat)");
-		exit(10);
-	}
-
-	real_lxstat64 = dlsym(RTLD_NEXT, "__lxstat64");
-	if (real_lxstat64 == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(_lxstat64)");
-		exit(10);
-	}
-
-	real_fxstat = dlsym(RTLD_NEXT, "__fxstat");
-	if (real_fxstat == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(__fxstat)");
-		exit(10);
-	}
-
-	real_fxstat64 = dlsym(RTLD_NEXT, "__fxstat64");
-	if (real_fxstat64 == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(__fxstat64)");
-		exit(10);
-	}
-
-	real_fxstatat = dlsym(RTLD_NEXT, "__fxstatat");
-	if (real_fxstatat == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(__fxstatat)");
-		exit(10);
-	}
-
-	real_fxstatat64 = dlsym(RTLD_NEXT, "__fxstatat64");
-	if (real_fxstatat64 == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(__fxstatat64)");
-		exit(10);
-	}
-
-	real_fallocate = dlsym(RTLD_NEXT, "fallocate");
-	if (real_fallocate == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(fallocate)");
-		exit(10);
-	}
-
-	real_dup2 = dlsym(RTLD_NEXT, "dup2");
-	if (real_dup2 == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(dup2)");
-		exit(10);
-	}
-
-	real_truncate = dlsym(RTLD_NEXT, "truncate");
-	if (real_truncate == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(truncate)");
-		exit(10);
-	}
-
-	real_ftruncate = dlsym(RTLD_NEXT, "ftruncate");
-	if (real_ftruncate == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(ftruncate)");
-		exit(10);
-	}
-
-	real_chmod = dlsym(RTLD_NEXT, "chmod");
-	if (real_chmod == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(chmod)");
-		exit(10);
-	}
-
-	real_fchmod = dlsym(RTLD_NEXT, "fchmod");
-	if (real_fchmod == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(fchmod)");
-		exit(10);
-	}
-
-	real_fchmodat = dlsym(RTLD_NEXT, "fchmodat");
-	if (real_fchmodat == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(fchmodat)");
-		exit(10);
-	}
-
-	real_chown = dlsym(RTLD_NEXT, "chown");
-	if (real_chown == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(chown)");
-		exit(10);
-	}
-
-	real_fchown = dlsym(RTLD_NEXT, "fchown");
-	if (real_fchown == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(fchown)");
-		exit(10);
-	}
-
-	real_fchownat = dlsym(RTLD_NEXT, "fchownat");
-	if (real_fchownat == NULL) {
-		LD_NFS_DPRINTF(0, "Failed to dlsym(fchownat)");
-		exit(10);
-	}
+	DLSYM(open)
+	DLSYM(close)
+	DLSYM(read)
+	DLSYM(pread)
+	DLSYM(write)
+	DLSYM(pwrite)
+	DLSYM(__xstat)
+	DLSYM(__xstat64)
+	DLSYM(__lxstat)
+	DLSYM(__lxstat64)
+	DLSYM(__fxstat)
+	DLSYM(__fxstat64)
+	DLSYM(__fxstatat)
+	DLSYM(__fxstatat64)
+	DLSYM(fallocate)
+	DLSYM(dup2)
+	DLSYM(truncate)
+	DLSYM(ftruncate)
+	DLSYM(chmod)
+	DLSYM(fchmod)
+	DLSYM(fchmodat)
+	DLSYM(chown)
+	DLSYM(fchown)
+	DLSYM(fchownat)
+	DLSYM(opendir)
+	DLSYM(readdir)
+	DLSYM(readdir_r)
+	DLSYM(closedir)
+	DLSYM(rewinddir)
+	DLSYM(seekdir)
+	DLSYM(telldir)
 }
